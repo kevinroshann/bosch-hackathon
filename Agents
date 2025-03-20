@@ -1,0 +1,206 @@
+!pip install sentence-transformers duckduckgo-search spacy
+
+import json
+import os
+import spacy
+from sentence_transformers import SentenceTransformer, util
+from duckduckgo_search import DDGS
+
+# ========== STORAGE SYSTEM ==========
+class ResearchMemory:
+    """Handles storing and retrieving past research results."""
+    
+    def __init__(self, filename="research_memory.json"):
+        self.filename = filename
+        self.data = self._load_memory()
+
+    def _load_memory(self):
+        """Loads memory from file or initializes empty storage."""
+        if os.path.exists(self.filename):
+            with open(self.filename, "r") as f:
+                return json.load(f)
+        return {}
+
+    def save_result(self, query, result):
+        """Stores research results in memory."""
+        self.data[query] = result
+        with open(self.filename, "w") as f:
+            json.dump(self.data, f, indent=4)
+
+    def retrieve_result(self, query):
+        """Retrieves past research result if available."""
+        return self.data.get(query, None)
+
+memory = ResearchMemory()
+
+# ========== NLP-BASED SEARCH SYSTEM ==========
+class WebSearchAgent:
+    """Uses DuckDuckGo API and NLP to extract the most relevant research result."""
+
+    def __init__(self):
+        self.model = SentenceTransformer("all-MiniLM-L6-v2")  # Lightweight but powerful semantic search model
+        self.nlp = spacy.load("en_core_web_sm")
+
+    def rank_results(self, query, results):
+        """Ranks search results by semantic similarity to the query."""
+        query_embedding = self.model.encode(query, convert_to_tensor=True)
+        result_texts = [res["body"] for res in results if "body" in res and len(res["body"]) > 50]
+
+        if not result_texts:
+            return "No highly relevant results found."
+
+        result_embeddings = self.model.encode(result_texts, convert_to_tensor=True)
+        similarity_scores = util.pytorch_cos_sim(query_embedding, result_embeddings)[0]
+
+        # Get the most relevant result
+        best_idx = similarity_scores.argmax().item()
+        return result_texts[best_idx]
+
+    def get_best_result(self, query):
+        """Fetches web search results and selects the most relevant one."""
+        with DDGS() as ddgs:
+            search_results = ddgs.text(query, max_results=5)  # Get top 5 results
+
+        if not search_results:
+            return "No relevant data found in search."
+
+        best_result = self.rank_results(query, search_results)
+        return best_result
+
+# ========== AGENTS ==========
+class GenerationAgent:
+    """Creates an initial hypothesis based on the query and retrieves relevant web data."""
+    
+    def __init__(self):
+        self.web_search = WebSearchAgent()
+
+    def process(self, query_data):
+        """Generates an initial research hypothesis."""
+        query = query_data["query"]
+        web_context = self.web_search.get_best_result(query)
+
+        hypothesis = f"Based on current research, {query} may involve the following key findings: {web_context}"
+        return {"hypothesis": hypothesis, "raw_data": web_context}
+
+class ReflectionAgent:
+    """Ensures the generated hypothesis makes logical sense."""
+    
+    def __init__(self):
+        self.nlp = spacy.load("en_core_web_sm")
+
+    def process(self, hypothesis_data):
+        doc = self.nlp(hypothesis_data["hypothesis"])
+        has_subject = any(token.dep_ in ["nsubj", "nsubjpass"] for token in doc)
+        has_verb = any(token.pos_ in ["VERB", "AUX"] for token in doc)
+
+        coherent = has_subject and has_verb
+        return {**hypothesis_data, "coherent": coherent}
+
+class RankingAgent:
+    """Scores the hypothesis based on factual validation from external sources."""
+    
+    def __init__(self):
+        self.web_search = WebSearchAgent()
+
+    def process(self, hypothesis_data):
+        """Assigns a confidence score based on web validation."""
+        hypothesis = hypothesis_data["hypothesis"]
+        support_evidence = self.web_search.get_best_result(hypothesis)
+        
+        confidence_score = len(support_evidence.split()) // 10  # More words = more validation
+        score = min(confidence_score, 10)
+
+        print(f"🔢 Ranking Score: {score}/10 for '{hypothesis}'")  # Display ranking in output
+
+        return {**hypothesis_data, "score": score}
+
+class EvolutionAgent:
+    """Refines hypotheses by selecting the most relevant web result for improvement."""
+
+    def __init__(self):
+        self.web_search = WebSearchAgent()
+
+    def process(self, hypothesis_data):
+        """Refines the hypothesis for better clarity and detail."""
+        if hypothesis_data["score"] >= 6:
+            return hypothesis_data  # No refinement needed
+
+        best_search_result = self.web_search.get_best_result(hypothesis_data["hypothesis"])
+        refined_hypothesis = f"{hypothesis_data['hypothesis']} Further verification shows: {best_search_result}."
+
+        return {**hypothesis_data, "refined_hypothesis": refined_hypothesis}
+
+class ProximityAgent:
+    """Finds past research related to the current query."""
+    
+    def __init__(self, memory):
+        self.memory = memory
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+
+    def process(self, hypothesis_data):
+        """Checks memory for similar past research and integrates it."""
+        stored_queries = list(self.memory.data.keys())
+        if not stored_queries:
+            return hypothesis_data
+
+        query_embedding = self.model.encode(hypothesis_data["hypothesis"], convert_to_tensor=True)
+        stored_embeddings = [self.model.encode(q, convert_to_tensor=True) for q in stored_queries]
+        similarities = [util.pytorch_cos_sim(query_embedding, emb)[0][0].item() for emb in stored_embeddings]
+
+        best_match_idx = similarities.index(max(similarities))
+        if similarities[best_match_idx] > 0.7:
+            past_research = self.memory.retrieve_result(stored_queries[best_match_idx])
+            return {**hypothesis_data, "past_research": past_research}
+
+        return hypothesis_data
+
+class MetaReviewAgent:
+    """Finalizes the research process by checking completeness."""
+
+    def process(self, hypothesis_data):
+        if hypothesis_data["score"] >= 6:
+            print("\n✅ Meta-Review Agent: Research is complete!")
+            return {"Final Research Summary": hypothesis_data["hypothesis"], "status": "Completed"}
+
+        print("\n🔄 Meta-Review Agent: Research needs improvement. Refining further...")
+        return {"Final Research Summary": hypothesis_data["refined_hypothesis"], "status": "Needs Refinement"}
+
+# ========== SUPERVISOR ==========
+class Supervisor:
+    """Manages the full research workflow with iterative improvement."""
+    
+    def __init__(self):
+        self.memory = ResearchMemory()
+        self.agents = [
+            GenerationAgent(),
+            ReflectionAgent(),
+            RankingAgent(),
+            EvolutionAgent(),
+            ProximityAgent(self.memory),
+            MetaReviewAgent()
+        ]
+
+    def process_query(self, query):
+        """Runs the research process iteratively until research is finalized."""
+        hypothesis_data = {"query": query, "original_query": query}  # Preserve the original query
+        max_iterations = 3  # Prevent infinite looping
+        iteration = 0
+
+        while iteration < max_iterations:
+            print(f"\n🔄 Iteration {iteration + 1}...")
+            for agent in self.agents:
+                hypothesis_data = agent.process(hypothesis_data)
+                hypothesis_data["query"] = hypothesis_data.get("original_query", query)  # Ensure query persists
+
+            if hypothesis_data["status"] == "Completed":
+                break  # ✅ Stop if research is finalized
+
+            iteration += 1  # Continue refinement loop
+
+        print("\n✅ Final Research Output:", hypothesis_data)
+
+
+# ========== RUN SYSTEM ==========
+supervisor = Supervisor()
+user_query = input("Enter your research query: ")
+supervisor.process_query(user_query)
